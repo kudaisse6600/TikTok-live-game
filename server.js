@@ -1,6 +1,6 @@
 import express from 'express';
 import {WebSocketServer, WebSocket} from 'ws';
-import {WebcastPushConnection} from 'tiktok-live-connector';
+import { TikTokLiveConnection } from 'tiktok-live-connector';
 import crypto from 'node:crypto';
 
 const app=express();
@@ -15,7 +15,7 @@ const validUser=s=>typeof s==='string'&&s.length>0&&s.length<=80;
 function broadcast(payload){const msg=JSON.stringify(payload);for(const c of wss.clients)if(c.readyState===WebSocket.OPEN)c.send(msg)}
 function event(type,info){if(!validUser(info.user))return;const payload={type,user:info.user.replace(/^@/,''),...info,at:Date.now()};status.lastEvent=payload.at;broadcast(payload)}
 function dedupe(key){const now=Date.now();for(const [k,v] of recent)if(now-v>90000)recent.delete(k);if(recent.has(key))return false;recent.set(key,now);return true}
-function startTikTok(){if(!username){status.error='Set TIKTOK_USERNAME in your hosting environment';return}connector=new WebcastPushConnection(username,{enableExtendedGiftInfo:true});
+function startTikTok(){if(!username){status.error='Set TIKTOK_USERNAME in your hosting environment';return}connector=new TikTokLiveConnection((username,{enableExtendedGiftInfo:true});
 connector.on('connected',()=>{status.connected=true;status.error=null;broadcast({type:'status',...status})});
 connector.on('disconnected',()=>{status.connected=false;broadcast({type:'status',...status})});
 connector.on('streamEnd',()=>{status.connected=false;broadcast({type:'status',...status})});
