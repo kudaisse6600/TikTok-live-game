@@ -1,35 +1,108 @@
 import express from 'express';
-import {WebSocketServer, WebSocket} from 'ws';
+import { WebSocketServer, WebSocket } from 'ws';
 import { TikTokLiveConnection } from 'tiktok-live-connector';
 import crypto from 'node:crypto';
 
-const app=express();
-const PORT=Number(process.env.PORT||3000);
-const username=(process.env.TIKTOK_USERNAME||'').replace(/^@/,'').trim();
-const ADMIN_KEY=process.env.ADMIN_KEY||crypto.randomBytes(18).toString('hex');
-const maxGiftCoins=100000;
-let status={connected:false,username:username||null,error:null,lastEvent:null};
-let connector=null;
-const recent=new Map();
-const validUser=s=>typeof s==='string'&&s.length>0&&s.length<=80;
-function broadcast(payload){const msg=JSON.stringify(payload);for(const c of wss.clients)if(c.readyState===WebSocket.OPEN)c.send(msg)}
-function event(type,info){if(!validUser(info.user))return;const payload={type,user:info.user.replace(/^@/,''),...info,at:Date.now()};status.lastEvent=payload.at;broadcast(payload)}
-function dedupe(key){const now=Date.now();for(const [k,v] of recent)if(now-v>90000)recent.delete(k);if(recent.has(key))return false;recent.set(key,now);return true}
-function startTikTok(){if(!username){status.error='Set TIKTOK_USERNAME in your hosting environment';return}connector=new TikTokLiveConnection((username,{enableExtendedGiftInfo:true});
-connector.on('connected',()=>{status.connected=true;status.error=null;broadcast({type:'status',...status})});
-connector.on('disconnected',()=>{status.connected=false;broadcast({type:'status',...status})});
-connector.on('streamEnd',()=>{status.connected=false;broadcast({type:'status',...status})});
-connector.on('error',err=>{status.error=String(err?.message||err).slice(0,160);broadcast({type:'status',...status})});
-connector.on('chat',d=>{const msg=String(d.comment||'').trim().toUpperCase();if(msg==='RED'||msg==='BLUE'||msg==='!JOIN'||msg==='JOIN')event('chat',{user:d.uniqueId,comment:msg})});
-connector.on('member',d=>event('join',{user:d.uniqueId}));
-connector.on('follow',d=>event('follow',{user:d.uniqueId}));
-connector.on('gift',d=>{if(d.giftType===1&&!d.repeatEnd)return;const repeat=Math.min(1000,Math.max(1,Number(d.repeatCount)||1));const unit=Math.min(maxGiftCoins,Math.max(0,Number(d.diamondCount)||0));const coins=Math.min(maxGiftCoins,repeat*unit);if(!coins)return;const key=`${d.uniqueId}:${d.giftId}:${d.repeatCount}:${d.repeatEnd}:${d.msgId||''}`;if(!dedupe(key))return;event('gift',{user:d.uniqueId,coins,giftName:String(d.giftName||'Gift').slice(0,60)})});
-async function connect(){try{await connector.connect()}catch(err){status.connected=false;status.error=String(err?.message||err).slice(0,160);broadcast({type:'status',...status})}}
-connect();setInterval(()=>{if(!status.connected)connect()},30000);
-}
+const app = express();
+const PORT = Number(process.env.PORT || 3000);
+const username = String(process.env.TIKTOK_USERNAME || 'imagineaimv').replace(/^@/, '').trim();
+const maxGiftCoins = 100000;
+const status = { connected: false, username, error: null, lastEvent: null };
+const recent = new Map();
+let connector = null;
+let connecting = false;
+let retryTimer = null;
+
 app.use(express.static('public'));
-app.get('/api/status',(_req,res)=>res.json({connected:status.connected,username:status.username,error:status.error,lastEvent:status.lastEvent}));
-const server=app.listen(PORT,()=>{console.log('Kingdom Wars running on port '+PORT);startTikTok()});
-const wss=new WebSocketServer({server,path:'/events'});
-wss.on('connection',ws=>{ws.send(JSON.stringify({type:'status',...status}))});
-// No control endpoints exposed to public viewers. ADMIN_KEY reserved for future authenticated controls.
+app.get('/api/status', (_req, res) => res.json(status));
+const server = app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Kingdom Wars listening on port ${PORT}`);
+  void connectTikTok();
+});
+const wss = new WebSocketServer({ server, path: '/events' });
+wss.on('connection', ws => ws.send(JSON.stringify({ type: 'status', ...status })));
+
+function broadcast(payload) {
+  const message = JSON.stringify(payload);
+  for (const client of wss.clients) {
+    if (client.readyState === WebSocket.OPEN) client.send(message);
+  }
+}
+function updateStatus(patch) {
+  Object.assign(status, patch);
+  broadcast({ type: 'status', ...status });
+}
+function emitEvent(type, info) {
+  const user = String(info.user || '').replace(/^@/, '').trim();
+  if (!user || user.length > 80) return;
+  const payload = { ...info, type, user, at: Date.now() };
+  status.lastEvent = payload.at;
+  broadcast(payload);
+}
+function dedupe(key) {
+  const now = Date.now();
+  for (const [oldKey, at] of recent) if (now - at > 90000) recent.delete(oldKey);
+  if (recent.has(key)) return false;
+  recent.set(key, now);
+  return true;
+}
+function scheduleReconnect() {
+  if (retryTimer || status.connected || connecting) return;
+  retryTimer = setTimeout(() => {
+    retryTimer = null;
+    void connectTikTok();
+  }, 30000);
+}
+async function connectTikTok() {
+  if (connecting || status.connected) return;
+  if (!username) {
+    updateStatus({ error: 'Set TIKTOK_USERNAME in Render environment' });
+    return;
+  }
+  connecting = true;
+  try {
+    if (connector) {
+      connector.removeAllListeners();
+      try { connector.disconnect(); } catch { /* previous connection already closed */ }
+    }
+    connector = new TikTokLiveConnection(username, { enableExtendedGiftInfo: true });
+    connector.on('connected', () => {
+      updateStatus({ connected: true, error: null });
+      if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
+    });
+    const disconnected = () => {
+      updateStatus({ connected: false });
+      scheduleReconnect();
+    };
+    connector.on('disconnected', disconnected);
+    connector.on('streamEnd', disconnected);
+    connector.on('error', err => {
+      updateStatus({ error: String(err?.message || err).slice(0, 200) });
+    });
+    connector.on('chat', data => {
+      const comment = String(data.comment || '').trim().toUpperCase();
+      if (['RED', 'BLUE', '!JOIN', 'JOIN'].includes(comment)) {
+        emitEvent('chat', { user: data.uniqueId, comment });
+      }
+    });
+    connector.on('member', data => emitEvent('join', { user: data.uniqueId }));
+    connector.on('follow', data => emitEvent('follow', { user: data.uniqueId }));
+    connector.on('gift', data => {
+      // Streak gifts: count only the final event to avoid duplicate upgrades.
+      if (Number(data.giftType) === 1 && !data.repeatEnd) return;
+      const repeat = Math.min(1000, Math.max(1, Number(data.repeatCount) || 1));
+      const unit = Math.min(maxGiftCoins, Math.max(0, Number(data.diamondCount) || 0));
+      const coins = Math.min(maxGiftCoins, repeat * unit);
+      if (!coins) return;
+      const key = `${data.uniqueId}:${data.giftId}:${data.repeatCount}:${data.repeatEnd}:${data.msgId || ''}`;
+      if (!dedupe(key)) return;
+      emitEvent('gift', { user: data.uniqueId, coins, giftName: String(data.giftName || 'Gift').slice(0, 60) });
+    });
+    await connector.connect();
+  } catch (err) {
+    updateStatus({ connected: false, error: String(err?.message || err).slice(0, 200) });
+  } finally {
+    connecting = false;
+    if (!status.connected) scheduleReconnect();
+  }
+}
